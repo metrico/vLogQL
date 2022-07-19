@@ -9,6 +9,9 @@ import rand
 import net.http
 import net.websocket
 import v.vmod
+import strconv
+import regex
+import strings
 
 struct App {
 mut:
@@ -220,6 +223,179 @@ fn canary_emitter(mut app App, canary_string string, timer int, count int) ? {
 	go canary_emitter(mut app, canary_string, timer, next)
 }
 
+
+struct LogRow {
+    id string
+    ts i64
+    labels string
+    line string
+}
+
+fn export_logs_iteration(app App) i64 {
+	data := http.get_text('$app.api/loki/api/v1/query_range?query=$app.query&limit=10000&start=$app.start&end=$app.end')
+	res := json.decode(Response, data) or { exit(1) }
+	mut rows := []LogRow{len:0, cap:10000}
+	for row in res.data.result {
+		for log in row.values {
+		    ts := strconv.common_parse_int(log[0], 10, 63, false, false) or {0}
+		    labels := json.encode(row.stream)
+		    id := strconv.v_sprintf('%ld-%s', ts, labels)
+		    log_row := LogRow{id: id, ts: ts, labels: labels , line: log[1]}
+		    rows << log_row
+		}
+	}
+	rows.sort(a.id > b.id)
+	mut last_labels := ''
+	mut last_ts := i64(-1)
+	if rows.len > 1 {
+	    last_ts = rows.pop().ts
+	}
+	for r in rows {
+	    if r.ts == last_ts {
+	        continue
+	    }
+	    if last_labels != r.labels {
+	        println("\n" + r.labels)
+	        last_labels = r.labels
+	    }
+	    ts := time.unix(r.ts / 1000000000)
+	    time_sec := ts.custom_format('YYYY-MM-DDTHH:mm:ss')
+	    time_ofs := ts.custom_format('ZZZ')
+	    ns := r.ts % 1000000000
+	    line := r.line.trim('\n')
+	    strconv.v_printf('  %s.%09ld%s %s\n', time_sec, ns, time_ofs, line)
+
+	}
+	return last_ts
+}
+
+fn export_logs(app App) {
+    mut m_app := app
+    mut last_ts := i64(0)
+    for last_ts != -1 {
+        last_ts = export_logs_iteration(m_app)
+        m_app.end = strconv.v_sprintf('%ld', last_ts)
+        println(last_ts)
+    }
+}
+
+struct LogsImporter {
+mut:
+    stream_map map[string][][]string
+    labels string
+    log_time string
+    log_line string
+    size i64
+    eof bool
+pub mut:
+    app App
+}
+
+fn (l LogsImporter)has_key(key string) bool {
+    m := l.stream_map[key] or {
+        return false
+    }
+    return true || m.len >= 0
+}
+
+fn (mut l LogsImporter)add_line() {
+    if l.log_time != '' {
+        if l.has_key(l.labels) {
+            l.stream_map[l.labels] << [l.log_time, l.log_line]
+        } else {
+            l.stream_map[l.labels] = [[l.log_time, l.log_line]]
+        }
+        l.size = l.size + l.log_line.len
+        l.maybe_send()
+    }
+}
+
+fn (mut l LogsImporter)maybe_send() {
+    if l.size >= 10 * 1024 * 1024 {
+        l.send()
+    }
+}
+
+fn (mut l LogsImporter) send() {
+    mut builder := strings.new_builder(15*1024 * 1024)
+    mut i := 0
+    builder.write_string('{"streams":[')
+    for k, v in l.stream_map {
+        if i > 0 {
+            builder.write_string(',')
+        }
+        builder.write_string('{"stream":' + k + ',"values":')
+        builder.write_string(json.encode(v))
+        builder.write_string('}')
+        i++
+    }
+    builder.write_string(']}')
+    resp := http.post_json(strconv.v_sprintf('%s/loki/api/v1/push', l.app.api), builder.str()) or {
+        panic(err)
+    }
+    if !resp.status().is_success() {
+        status := resp.status().int()
+        bytes := resp.bytestr()
+        panic(strconv.v_sprintf('[%d] %s', status, bytes))
+    }
+    l.size = 0
+    l.stream_map = map[string][][]string
+}
+
+fn (mut l LogsImporter)read_line() string {
+    return os.input_opt('') or {
+        l.eof = true
+        return ''
+    }
+}
+
+fn (mut l LogsImporter)import_logs(app App) {
+    mut new_stream := regex.regex_opt('^\\{.+$') or {
+        println('invalid stream re')
+        panic(err)
+        return
+    }
+    mut new_line := regex.regex_opt(r"^  (?P<time>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}).(?P<ns>\d{0,9})(?P<ofs>[+\-][0-9:]+) (?P<line>.+)$") or {
+        println('invalid line re')
+        panic(err)
+        return
+    }
+    l.eof = false
+    for true {
+        line := l.read_line()
+        if l.eof {
+            break
+        }
+        if line == '' {
+            continue
+        }
+        if new_stream.matches_string(line) {
+            l.add_line()
+            l.labels = line
+            l.log_time = ''
+            l.log_line = ''
+            continue
+        }
+        if new_line.matches_string(line) {
+            l.add_line()
+            rfc3339 := new_line.get_group_by_name(line, 'time') + new_line.get_group_by_name(line, 'ofs')
+            t := time.parse_rfc3339(rfc3339) or {
+                println('can\'t parse time: ' + rfc3339)
+                continue
+            }
+            ns := strconv.common_parse_int(new_line.get_group_by_name(line, 'ns'), 10, 63, false, false) or {0}
+            ts := t.unix_time() * 1000000000 + ns
+            l.log_time = strconv.v_sprintf('%ld', ts)
+            l.log_line = new_line.get_group_by_name(line, 'line')
+            continue
+        }
+        l.log_line += '\n' + line
+    }
+    l.send()
+}
+
+
+
 fn main() {
 	mut app := &App{}
 	app.counter = (0).str()
@@ -246,6 +422,9 @@ fn main() {
 	logql_label := fp.string('label', `v`, '', 'get label values')
 	app.labels = logql_labels
 
+	logql_import := fp.bool('import', `t`, false, 'import exported log lines from stdin')
+    logql_export := fp.bool('export', `t`, false, 'export log lines to stdout')
+
 	logql_start := fp.string('start', `s`, now(3600), 'start nanosec timestamp')
 	logql_end := fp.string('end', `e`, now(0), 'end nanosec timestamp')
 	app.start = logql_start
@@ -263,7 +442,10 @@ fn main() {
 		return
 	}
 
-	if logql_query.len_utf8() > 0 {
+	if logql_import {
+    	mut l := LogsImporter{app: app}
+    	l.import_logs(app)
+    } else if logql_query.len_utf8() > 0 {
 		if logql_tail {
 			tail_logs(app) or { exit(1) }
 		} else if logql_canary {
@@ -272,6 +454,8 @@ fn main() {
 			tag = 'canary_' + tag
 			go canary_emitter(mut app, tag, env_canary_timer.int(), 0)
 			canary_logs(mut app, tag) or { exit(1) }
+		} else if logql_export {
+		    export_logs(app)
 		} else {
 			fetch_logs(app)
 		}
